@@ -1,6 +1,12 @@
 import { useMemo, useState } from 'react';
 import { alignCues, type AlignGroup } from './lib/align';
 import {
+  DEFAULT_CALIB_OPTIONS,
+  fitCalibration,
+  selectAnchors,
+  type CalibOptions,
+} from './lib/calibrate';
+import {
   autoFixTimes,
   buildMergedCues,
   defaultStateFor,
@@ -14,6 +20,7 @@ import { SAMPLE_A, SAMPLE_B } from './lib/samples';
 import { parseSrt, serializeSrt, type Cue } from './lib/srt';
 import { applyScrollChains, findScrollChains, type ScrollOptions } from './lib/scroll';
 import { smartWrap, type WrapOptions } from './lib/wrap';
+import { CalibratePanel } from './components/CalibratePanel';
 import { DedupePanel } from './components/DedupePanel';
 import { ExportPanel } from './components/ExportPanel';
 import { GroupCard } from './components/GroupCard';
@@ -23,6 +30,7 @@ import { Toolbar, type Filter } from './components/Toolbar';
 import { WrapPanel } from './components/WrapPanel';
 
 const PAGE_SIZE = 80;
+const STEP_LABELS = ['导入双版本', '时间轴校准', '顺序对齐', '解决冲突', '校验导出'];
 
 function download(filename: string, content: string) {
   const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
@@ -36,6 +44,8 @@ function download(filename: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
+type Phase = 'import' | 'calibrate' | 'workspace';
+
 export default function App() {
   const [nameA, setNameA] = useState('版本A.srt');
   const [nameB, setNameB] = useState('版本B.srt');
@@ -44,12 +54,34 @@ export default function App() {
   const cuesA = useMemo(() => parseSrt(textA), [textA]);
   const cuesB = useMemo(() => parseSrt(textB), [textB]);
 
+  const [phase, setPhase] = useState<Phase>('import');
+
+  // 时间轴校准：筛选参数、自动锚点、手动禁用集合，以及是否已应用
+  const [calibOpts, setCalibOpts] = useState<CalibOptions>(DEFAULT_CALIB_OPTIONS);
+  const calibAnchors = useMemo(
+    () => (cuesA.length > 0 && cuesB.length > 0 ? selectAnchors(cuesA, cuesB, calibOpts) : []),
+    [cuesA, cuesB, calibOpts],
+  );
+  const [calibDisabled, setCalibDisabled] = useState<ReadonlySet<string>>(new Set());
+  /** 手动强制启用被自动剔除锚点的覆盖集合 */
+  const [calibForced, setCalibForced] = useState<ReadonlySet<string>>(new Set());
+  const calibFit = useMemo(
+    () => fitCalibration(cuesA, cuesB, calibAnchors, calibDisabled, calibForced),
+    [cuesA, cuesB, calibAnchors, calibDisabled, calibForced],
+  );
+  /** 已提交到对齐链路的 B 时间轴（null 表示使用原始 cuesB） */
+  const [cuesBUsed, setCuesBUsed] = useState<Cue[] | null>(null);
+  const calibApplied = !!cuesBUsed;
+
   const [groups, setGroups] = useState<AlignGroup[] | null>(null);
   const [states, setStates] = useState<GroupState[]>([]);
   const [aligning, setAligning] = useState(false);
   const [filter, setFilter] = useState<Filter>('all');
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [autoFix, setAutoFix] = useState(false);
+
+  /** 当前对齐链路实际使用的 B：已校准提交时为校准后的时间轴，否则为原始 B。 */
+  const cuesBEff: Cue[] = groups ? (cuesBUsed ?? cuesB) : cuesB;
 
   // 智能断行：视图切换、参数与逐条应用状态（key 为 groupIndex）
   const [view, setView] = useState<'groups' | 'dedupe' | 'wrap'>('groups');
@@ -67,13 +99,14 @@ export default function App() {
   });
   const [scrollAccepted, setScrollAccepted] = useState<ReadonlySet<string>>(new Set());
 
-  const runAlign = (a: Cue[], b: Cue[]) => {
+  /** 用指定的 B 时间轴执行顺序对齐，并进入工作区。 */
+  const runAlign = (b: Cue[]) => {
     setAligning(true);
     // 让出一帧以渲染“对齐中”状态，再执行同步计算
     window.setTimeout(() => {
-      const gs = alignCues(a, b);
+      const gs = alignCues(cuesA, b);
       setGroups(gs);
-      setStates(gs.map((g) => defaultStateFor(g, a, b)));
+      setStates(gs.map((g) => defaultStateFor(g, cuesA, b)));
       setAligning(false);
       setFilter('all');
       setVisibleCount(PAGE_SIZE);
@@ -81,7 +114,70 @@ export default function App() {
       setView('groups');
       setWrapApplied(new Set());
       setScrollAccepted(new Set());
+      setPhase('workspace');
     }, 30);
+  };
+
+  const startCalibrate = () => {
+    if (cuesA.length === 0 || cuesB.length === 0) return;
+    setPhase('calibrate');
+  };
+
+  const skipCalibrate = () => {
+    if (cuesA.length === 0 || cuesB.length === 0) return;
+    setCuesBUsed(null);
+    runAlign(cuesB);
+  };
+
+  const applyCalibration = () => {
+    if (!calibFit.ok) return;
+    // 提交校准后的 B 时间作为对齐输入（仅此处替换）
+    setCuesBUsed(calibFit.mappedCues);
+    runAlign(calibFit.mappedCues);
+  };
+
+  const restoreOriginalB = () => {
+    setCuesBUsed(null);
+    runAlign(cuesB);
+  };
+
+  const toggleAnchor = (key: string) => {
+    const anchor = calibAnchors.find((a) => a.key === key);
+    if (!anchor) return;
+    if (anchor.autoKept) {
+      // 自动保留：勾选框控制禁用
+      setCalibForced((prev) => {
+        if (!prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+      setCalibDisabled((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    } else {
+      // 自动剔除：勾选框控制强制启用
+      setCalibDisabled((prev) => {
+        if (!prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+      setCalibForced((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    }
+  };
+
+  const resetAnchors = () => {
+    setCalibDisabled(new Set());
+    setCalibForced(new Set());
   };
 
   const handleText = (side: 'A' | 'B', text: string, name?: string) => {
@@ -99,15 +195,37 @@ export default function App() {
     setNameB('示例B.srt');
     setTextA(SAMPLE_A);
     setTextB(SAMPLE_B);
-    runAlign(parseSrt(SAMPLE_A), parseSrt(SAMPLE_B));
-  };
-
-  const reset = () => {
+    setCuesBUsed(null);
+    setCalibDisabled(new Set());
+    setCalibForced(new Set());
+    setCalibOpts(DEFAULT_CALIB_OPTIONS);
     setGroups(null);
     setStates([]);
+    setPhase('calibrate');
+  };
+
+  const resetAll = () => {
+    setGroups(null);
+    setStates([]);
+    setCuesBUsed(null);
+    setCalibDisabled(new Set());
+    setCalibForced(new Set());
     setView('groups');
     setWrapApplied(new Set());
     setScrollAccepted(new Set());
+    setPhase('import');
+  };
+
+  const recalibrate = () => {
+    setGroups(null);
+    setStates([]);
+    setCuesBUsed(null);
+    setCalibDisabled(new Set());
+    setCalibForced(new Set());
+    setView('groups');
+    setWrapApplied(new Set());
+    setScrollAccepted(new Set());
+    setPhase('calibrate');
   };
 
   const updateResolution = (gi: number, patch: Partial<Resolution>) => {
@@ -124,7 +242,7 @@ export default function App() {
       prev.map((s, i) => {
         const g = groups[i];
         if (g.aIdx.length === 0 || g.bIdx.length === 0) return s;
-        const text = choice === 'longer' ? suggestTextChoice(g, cuesA, cuesB) : choice;
+        const text = choice === 'longer' ? suggestTextChoice(g, cuesA, cuesBEff) : choice;
         return { ...s, resolved: true, resolution: { ...s.resolution, text } };
       }),
     );
@@ -151,7 +269,7 @@ export default function App() {
               resolved: true,
               resolution: {
                 ...s.resolution,
-                text: suggestTextChoice(groups[i], cuesA, cuesB),
+                text: suggestTextChoice(groups[i], cuesA, cuesBEff),
                 time: 'union',
               },
             }
@@ -173,8 +291,8 @@ export default function App() {
   };
 
   const merged = useMemo(
-    () => (groups ? buildMergedCues(groups, states, cuesA, cuesB) : null),
-    [groups, states, cuesA, cuesB],
+    () => (groups ? buildMergedCues(groups, states, cuesA, cuesBEff) : null),
+    [groups, states, cuesA, cuesBEff],
   );
 
   // 滚动字幕消重：在合并结果上识别滚动链，按已采纳链折叠后再进入断行/导出
@@ -312,7 +430,10 @@ export default function App() {
     return out;
   }, [groups, states, filter]);
 
-  const step = groups ? (unresolved > 0 ? 2 : 3) : cuesA.length > 0 && cuesB.length > 0 ? 1 : 0;
+  // 顶部步骤条：导入(0) / 校准(1) 为当前页；进入工作区后对齐(2) 已完成，
+  // 未解决冲突时停在“解决冲突”(3)，否则进入“校验导出”(4)
+  const step =
+    phase === 'import' ? 0 : phase === 'calibrate' ? 1 : groups ? (unresolved > 0 ? 3 : 4) : 1;
 
   const jumpToGroup = (gi: number) => {
     document.getElementById(`group-${gi}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -325,11 +446,11 @@ export default function App() {
           <span className="logo">⇄</span>
           <div>
             <h1>字幕对齐合并工具</h1>
-            <p>双版本 SRT 顺序对齐 · 冲突决策 · 合并导出</p>
+            <p>双版本 SRT 时间轴校准 · 顺序对齐 · 冲突决策 · 合并导出</p>
           </div>
         </div>
         <ol className="steps">
-          {['导入双版本', '顺序对齐', '解决冲突', '校验导出'].map((label, i) => (
+          {STEP_LABELS.map((label, i) => (
             <li key={label} className={i < step ? 'done' : i === step ? 'active' : ''}>
               <span className="step-n">{i < step ? '✓' : i + 1}</span>
               {label}
@@ -338,7 +459,7 @@ export default function App() {
         </ol>
       </header>
 
-      {!groups ? (
+      {phase === 'import' ? (
         <ImportPanel
           nameA={nameA}
           nameB={nameB}
@@ -346,135 +467,168 @@ export default function App() {
           textB={textB}
           cuesA={cuesA}
           cuesB={cuesB}
-          aligning={aligning}
+          busy={aligning}
           onText={handleText}
-          onAlign={() => runAlign(cuesA, cuesB)}
+          onCalibrate={startCalibrate}
+          onSkipCalibrate={skipCalibrate}
           onSample={loadSample}
         />
+      ) : phase === 'calibrate' ? (
+        <CalibratePanel
+          nameA={nameA}
+          nameB={nameB}
+          cuesA={cuesA}
+          cuesB={cuesB}
+          anchors={calibAnchors}
+          fit={calibFit}
+          options={calibOpts}
+          onOptions={setCalibOpts}
+          disabled={calibDisabled}
+          forced={calibForced}
+          onToggle={toggleAnchor}
+          onReset={resetAnchors}
+          applied={false}
+          aligning={aligning}
+          onApply={applyCalibration}
+          onUseOriginal={restoreOriginalB}
+          onBack={() => setPhase('import')}
+        />
       ) : (
-        <>
-          <div className="import-summary">
-            <span className="file-chip a">{nameA} · {cuesA.length} 条</span>
-            <span className="swap">⇄</span>
-            <span className="file-chip b">{nameB} · {cuesB.length} 条</span>
-            <span className="spacer" />
-            <button className="btn sm" onClick={reset}>
-              重新导入
-            </button>
-          </div>
-
-          <div className="layout">
-            <main className="main-col">
-              <StatsBar groups={groups} states={states} />
-              <div className="tabs view-tabs">
-                <button
-                  className={`tab ${view === 'groups' ? 'active' : ''}`}
-                  onClick={() => setView('groups')}
-                >
-                  对齐分组
-                  <span className="tab-count">{groups.length}</span>
-                </button>
-                <button
-                  className={`tab ${view === 'dedupe' ? 'active' : ''}`}
-                  onClick={() => setView('dedupe')}
-                >
-                  滚动字幕消重
-                  <span className="tab-count">{dedupStats.appliedChains}</span>
-                </button>
-                <button
-                  className={`tab ${view === 'wrap' ? 'active' : ''}`}
-                  onClick={() => setView('wrap')}
-                >
-                  智能断行
-                  <span className="tab-count">{wrapStats.appliedCount}</span>
-                </button>
-              </div>
-              {view === 'groups' ? (
-                <>
-                  <Toolbar
-                    filter={filter}
-                    counts={counts}
-                    onFilter={(f) => {
-                      setFilter(f);
-                      setVisibleCount(PAGE_SIZE);
-                    }}
-                    onBulkText={bulkText}
-                    onBulkTime={bulkTime}
-                    onResolveSuggested={resolveSuggested}
-                    onOnlyKeep={setOnlyKeep}
-                  />
-                  <div className="group-list">
-                    {filtered.slice(0, visibleCount).map((gi) => (
-                      <GroupCard
-                        key={groups[gi].id}
-                        index={gi}
-                        group={groups[gi]}
-                        state={states[gi]}
-                        cuesA={cuesA}
-                        cuesB={cuesB}
-                        suggestion={suggestTextChoice(groups[gi], cuesA, cuesB)}
-                        onResolve={(patch) => updateResolution(gi, patch)}
-                      />
-                    ))}
-                    {filtered.length === 0 && (
-                      <div className="empty">当前筛选条件下没有对齐组。</div>
-                    )}
-                    {filtered.length > visibleCount && (
-                      <button className="btn more" onClick={() => setVisibleCount((v) => v + PAGE_SIZE)}>
-                        显示更多（剩余 {filtered.length - visibleCount} 组）
-                      </button>
-                    )}
-                  </div>
-                </>
-              ) : view === 'dedupe' ? (
-                <DedupePanel
-                  cues={merged?.cues ?? []}
-                  options={scrollOpts}
-                  onOptions={setScrollOpts}
-                  accepted={scrollAccepted}
-                  onAccept={acceptChain}
-                  onRestore={restoreChain}
-                  onAcceptAll={acceptAllChains}
-                  onRestoreAll={restoreAllChains}
-                />
+        groups && (
+          <>
+            <div className="import-summary">
+              <span className="file-chip a">{nameA} · {cuesA.length} 条</span>
+              <span className="swap">⇄</span>
+              <span className="file-chip b">{nameB} · {cuesBEff.length} 条</span>
+              {calibApplied ? (
+                <span className="calib-chip on" title={`${calibFit.active.length} 个锚点 · 分段线性映射`}>
+                  ✓ 时间轴已校准（{calibFit.active.length} 锚点）
+                </span>
               ) : (
-                <WrapPanel
-                  cues={dedupedCues}
-                  results={wrapResults}
-                  applied={wrapApplied}
-                  options={wrapOpts}
-                  onOptions={setWrapOpts}
-                  onApply={applyWrap}
-                  onRestore={restoreWrap}
-                  onApplyAll={applyAllWrap}
-                  onRestoreAll={restoreAllWrap}
-                />
+                <span className="calib-chip off">使用原始 B 时间</span>
               )}
-            </main>
+              <span className="spacer" />
+              <button className="btn sm" onClick={recalibrate}>
+                时间轴校准
+              </button>
+              <button className="btn sm" onClick={resetAll}>
+                重新导入
+              </button>
+            </div>
 
-            <ExportPanel
-              conflictCount={conflictCount}
-              resolvedCount={resolvedCount}
-              unresolved={unresolved}
-              issues={issues}
-              autoFix={autoFix}
-              onAutoFix={setAutoFix}
-              cueCount={finalCues.length}
-              dedupChains={dedupStats.chainCount}
-              dedupApplied={dedupStats.appliedChains}
-              dedupSaved={dedupStats.saved}
-              wrapApplied={wrapStats.appliedCount}
-              wrapFailed={wrapStats.failed}
-              preview={preview}
-              canExport={canExport}
-              onExport={() => download('merged.srt', '\uFEFF' + serializeSrt(finalCues))}
-              onJump={jumpToGroup}
-            />
-          </div>
-        </>
+            <div className="layout">
+              <main className="main-col">
+                <StatsBar groups={groups} states={states} />
+                <div className="tabs view-tabs">
+                  <button
+                    className={`tab ${view === 'groups' ? 'active' : ''}`}
+                    onClick={() => setView('groups')}
+                  >
+                    对齐分组
+                    <span className="tab-count">{groups.length}</span>
+                  </button>
+                  <button
+                    className={`tab ${view === 'dedupe' ? 'active' : ''}`}
+                    onClick={() => setView('dedupe')}
+                  >
+                    滚动字幕消重
+                    <span className="tab-count">{dedupStats.appliedChains}</span>
+                  </button>
+                  <button
+                    className={`tab ${view === 'wrap' ? 'active' : ''}`}
+                    onClick={() => setView('wrap')}
+                  >
+                    智能断行
+                    <span className="tab-count">{wrapStats.appliedCount}</span>
+                  </button>
+                </div>
+                {view === 'groups' ? (
+                  <>
+                    <Toolbar
+                      filter={filter}
+                      counts={counts}
+                      onFilter={(f) => {
+                        setFilter(f);
+                        setVisibleCount(PAGE_SIZE);
+                      }}
+                      onBulkText={bulkText}
+                      onBulkTime={bulkTime}
+                      onResolveSuggested={resolveSuggested}
+                      onOnlyKeep={setOnlyKeep}
+                    />
+                    <div className="group-list">
+                      {filtered.slice(0, visibleCount).map((gi) => (
+                        <GroupCard
+                          key={groups[gi].id}
+                          index={gi}
+                          group={groups[gi]}
+                          state={states[gi]}
+                          cuesA={cuesA}
+                          cuesB={cuesBEff}
+                          suggestion={suggestTextChoice(groups[gi], cuesA, cuesBEff)}
+                          onResolve={(patch) => updateResolution(gi, patch)}
+                        />
+                      ))}
+                      {filtered.length === 0 && (
+                        <div className="empty">当前筛选条件下没有对齐组。</div>
+                      )}
+                      {filtered.length > visibleCount && (
+                        <button className="btn more" onClick={() => setVisibleCount((v) => v + PAGE_SIZE)}>
+                          显示更多（剩余 {filtered.length - visibleCount} 组）
+                        </button>
+                      )}
+                    </div>
+                  </>
+                ) : view === 'dedupe' ? (
+                  <DedupePanel
+                    cues={merged?.cues ?? []}
+                    options={scrollOpts}
+                    onOptions={setScrollOpts}
+                    accepted={scrollAccepted}
+                    onAccept={acceptChain}
+                    onRestore={restoreChain}
+                    onAcceptAll={acceptAllChains}
+                    onRestoreAll={restoreAllChains}
+                  />
+                ) : (
+                  <WrapPanel
+                    cues={dedupedCues}
+                    results={wrapResults}
+                    applied={wrapApplied}
+                    options={wrapOpts}
+                    onOptions={setWrapOpts}
+                    onApply={applyWrap}
+                    onRestore={restoreWrap}
+                    onApplyAll={applyAllWrap}
+                    onRestoreAll={restoreAllWrap}
+                  />
+                )}
+              </main>
+
+              <ExportPanel
+                conflictCount={conflictCount}
+                resolvedCount={resolvedCount}
+                unresolved={unresolved}
+                issues={issues}
+                autoFix={autoFix}
+                onAutoFix={setAutoFix}
+                cueCount={finalCues.length}
+                dedupChains={dedupStats.chainCount}
+                dedupApplied={dedupStats.appliedChains}
+                dedupSaved={dedupStats.saved}
+                wrapApplied={wrapStats.appliedCount}
+                wrapFailed={wrapStats.failed}
+                preview={preview}
+                canExport={canExport}
+                onExport={() => download('merged.srt', '\uFEFF' + serializeSrt(finalCues))}
+                onJump={jumpToGroup}
+              />
+            </div>
+          </>
+        )
       )}
 
-      <footer className="foot">纯前端本地运行 · 字幕数据不会离开浏览器 · 对齐与校验均在本地完成</footer>
+      <footer className="foot">纯前端本地运行 · 字幕数据不会离开浏览器 · 校准、对齐与校验均在本地完成</footer>
     </div>
   );
 }
