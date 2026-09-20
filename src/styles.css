@@ -1128,6 +1128,71 @@ body {
   color: var(--amber);
 }
 
+/* ---------- 时间轴校准 ---------- */
+.calib-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.calib-intro h2 {
+  margin: 0 0 4px;
+  font-size: 17px;
+}
+
+.calib-intro p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.calib-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.calib-entry {
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: var(--bg-soft);
+}
+
+.calib-entry.off {
+  opacity: 0.55;
+}
+
+.calib-entry .cue-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.calib-texts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 6px;
+}
+
+.calib-text {
+  padding-left: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.calib-text.a {
+  border-left: 3px solid #3b82f6;
+}
+
+.calib-text.b {
+  border-left: 3px solid #8b5cf6;
+}
+
 /* ---------- 响应式 ---------- */
 @media (max-width: 1100px) {
   .layout {
@@ -1153,6 +1218,10 @@ body {
   }
 
   .we-cols {
+    grid-template-columns: 1fr;
+  }
+
+  .calib-texts {
     grid-template-columns: 1fr;
   }
 }

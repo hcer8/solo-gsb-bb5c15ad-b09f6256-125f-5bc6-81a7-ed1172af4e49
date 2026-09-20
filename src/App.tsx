@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { alignCues, type AlignGroup } from './lib/align';
+import { DEFAULT_CALIB_OPTIONS, type CalibOptions } from './lib/calibrate';
 import {
   autoFixTimes,
   buildMergedCues,
@@ -14,6 +15,7 @@ import { SAMPLE_A, SAMPLE_B } from './lib/samples';
 import { parseSrt, serializeSrt, type Cue } from './lib/srt';
 import { applyScrollChains, findScrollChains, type ScrollOptions } from './lib/scroll';
 import { smartWrap, type WrapOptions } from './lib/wrap';
+import { CalibratePanel } from './components/CalibratePanel';
 import { DedupePanel } from './components/DedupePanel';
 import { ExportPanel } from './components/ExportPanel';
 import { GroupCard } from './components/GroupCard';
@@ -50,6 +52,14 @@ export default function App() {
   const [filter, setFilter] = useState<Filter>('all');
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
   const [autoFix, setAutoFix] = useState(false);
+
+  // 时间轴校准：导入 → 校准 → 对齐；校准后的 B 仅在点击「应用校准」后替换对齐输入
+  const [stage, setStage] = useState<'import' | 'calibrate'>('import');
+  const [calibOpts, setCalibOpts] = useState<CalibOptions>(DEFAULT_CALIB_OPTIONS);
+  const [calibDisabled, setCalibDisabled] = useState<ReadonlySet<string>>(new Set());
+  /** 已应用的校准结果（null 表示对齐使用原始 B 时间轴） */
+  const [cuesBCal, setCuesBCal] = useState<Cue[] | null>(null);
+  const cuesBAligned = cuesBCal ?? cuesB;
 
   // 智能断行：视图切换、参数与逐条应用状态（key 为 groupIndex）
   const [view, setView] = useState<'groups' | 'dedupe' | 'wrap'>('groups');
@@ -99,7 +109,8 @@ export default function App() {
     setNameB('示例B.srt');
     setTextA(SAMPLE_A);
     setTextB(SAMPLE_B);
-    runAlign(parseSrt(SAMPLE_A), parseSrt(SAMPLE_B));
+    setCuesBCal(null);
+    setStage('calibrate');
   };
 
   const reset = () => {
@@ -108,7 +119,40 @@ export default function App() {
     setView('groups');
     setWrapApplied(new Set());
     setScrollAccepted(new Set());
+    setStage('import');
+    setCuesBCal(null);
+    setCalibDisabled(new Set());
   };
+
+  /** 应用校准：用映射后的 B 替换对齐输入并立即进入顺序对齐 */
+  const applyCalibration = (calibratedB: Cue[]) => {
+    setCuesBCal(calibratedB);
+    runAlign(cuesA, calibratedB);
+  };
+
+  /** 不应用校准（或一键恢复原始 B 时间）：用原始 B 重新对齐 */
+  const alignWithoutCalibration = () => {
+    setCuesBCal(null);
+    runAlign(cuesA, cuesB);
+  };
+
+  /** 从对齐结果返回校准页调整锚点（保留已禁用锚点与参数） */
+  const backToCalibrate = () => {
+    setGroups(null);
+    setStates([]);
+    setView('groups');
+    setWrapApplied(new Set());
+    setScrollAccepted(new Set());
+    setStage('calibrate');
+  };
+
+  const toggleCalibAnchor = (key: string) =>
+    setCalibDisabled((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   const updateResolution = (gi: number, patch: Partial<Resolution>) => {
     setStates((prev) =>
@@ -124,7 +168,7 @@ export default function App() {
       prev.map((s, i) => {
         const g = groups[i];
         if (g.aIdx.length === 0 || g.bIdx.length === 0) return s;
-        const text = choice === 'longer' ? suggestTextChoice(g, cuesA, cuesB) : choice;
+        const text = choice === 'longer' ? suggestTextChoice(g, cuesA, cuesBAligned) : choice;
         return { ...s, resolved: true, resolution: { ...s.resolution, text } };
       }),
     );
@@ -151,7 +195,7 @@ export default function App() {
               resolved: true,
               resolution: {
                 ...s.resolution,
-                text: suggestTextChoice(groups[i], cuesA, cuesB),
+                text: suggestTextChoice(groups[i], cuesA, cuesBAligned),
                 time: 'union',
               },
             }
@@ -173,8 +217,8 @@ export default function App() {
   };
 
   const merged = useMemo(
-    () => (groups ? buildMergedCues(groups, states, cuesA, cuesB) : null),
-    [groups, states, cuesA, cuesB],
+    () => (groups ? buildMergedCues(groups, states, cuesA, cuesBAligned) : null),
+    [groups, states, cuesA, cuesBAligned],
   );
 
   // 滚动字幕消重：在合并结果上识别滚动链，按已采纳链折叠后再进入断行/导出
@@ -312,7 +356,15 @@ export default function App() {
     return out;
   }, [groups, states, filter]);
 
-  const step = groups ? (unresolved > 0 ? 2 : 3) : cuesA.length > 0 && cuesB.length > 0 ? 1 : 0;
+  const step = groups
+    ? unresolved > 0
+      ? 3
+      : 4
+    : aligning
+      ? 2
+      : cuesA.length > 0 && cuesB.length > 0
+        ? 1
+        : 0;
 
   const jumpToGroup = (gi: number) => {
     document.getElementById(`group-${gi}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -329,7 +381,7 @@ export default function App() {
           </div>
         </div>
         <ol className="steps">
-          {['导入双版本', '顺序对齐', '解决冲突', '校验导出'].map((label, i) => (
+          {['导入双版本', '时间轴校准', '顺序对齐', '解决冲突', '校验导出'].map((label, i) => (
             <li key={label} className={i < step ? 'done' : i === step ? 'active' : ''}>
               <span className="step-n">{i < step ? '✓' : i + 1}</span>
               {label}
@@ -339,25 +391,49 @@ export default function App() {
       </header>
 
       {!groups ? (
-        <ImportPanel
-          nameA={nameA}
-          nameB={nameB}
-          textA={textA}
-          textB={textB}
-          cuesA={cuesA}
-          cuesB={cuesB}
-          aligning={aligning}
-          onText={handleText}
-          onAlign={() => runAlign(cuesA, cuesB)}
-          onSample={loadSample}
-        />
+        stage === 'import' ? (
+          <ImportPanel
+            nameA={nameA}
+            nameB={nameB}
+            textA={textA}
+            textB={textB}
+            cuesA={cuesA}
+            cuesB={cuesB}
+            onText={handleText}
+            onNext={() => setStage('calibrate')}
+            onSample={loadSample}
+          />
+        ) : (
+          <CalibratePanel
+            nameA={nameA}
+            nameB={nameB}
+            cuesA={cuesA}
+            cuesB={cuesB}
+            options={calibOpts}
+            onOptions={setCalibOpts}
+            disabled={calibDisabled}
+            onToggle={toggleCalibAnchor}
+            onApply={applyCalibration}
+            onSkip={alignWithoutCalibration}
+            onBack={() => setStage('import')}
+          />
+        )
       ) : (
         <>
           <div className="import-summary">
             <span className="file-chip a">{nameA} · {cuesA.length} 条</span>
             <span className="swap">⇄</span>
-            <span className="file-chip b">{nameB} · {cuesB.length} 条</span>
+            <span className="file-chip b">{nameB} · {cuesBAligned.length} 条</span>
+            {cuesBCal && <span className="tag ok">B 时间轴已校准</span>}
             <span className="spacer" />
+            {cuesBCal && (
+              <button className="btn sm" onClick={alignWithoutCalibration}>
+                恢复原始 B 时间
+              </button>
+            )}
+            <button className="btn sm" onClick={backToCalibrate}>
+              时间轴校准
+            </button>
             <button className="btn sm" onClick={reset}>
               重新导入
             </button>
@@ -411,8 +487,8 @@ export default function App() {
                         group={groups[gi]}
                         state={states[gi]}
                         cuesA={cuesA}
-                        cuesB={cuesB}
-                        suggestion={suggestTextChoice(groups[gi], cuesA, cuesB)}
+                        cuesB={cuesBAligned}
+                        suggestion={suggestTextChoice(groups[gi], cuesA, cuesBAligned)}
                         onResolve={(patch) => updateResolution(gi, patch)}
                       />
                     ))}

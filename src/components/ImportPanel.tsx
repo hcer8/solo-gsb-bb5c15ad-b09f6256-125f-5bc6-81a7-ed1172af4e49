@@ -9,14 +9,14 @@ interface ImportPanelProps {
   textB: string;
   cuesA: Cue[];
   cuesB: Cue[];
-  aligning: boolean;
   onText(side: 'A' | 'B', text: string, name?: string): void;
-  onAlign(): void;
+  /** 导入完成，进入时间轴校准步骤 */
+  onNext(): void;
   onSample(): void;
 }
 
 export function ImportPanel(props: ImportPanelProps) {
-  const canAlign = props.cuesA.length > 0 && props.cuesB.length > 0 && !props.aligning;
+  const canNext = props.cuesA.length > 0 && props.cuesB.length > 0;
   return (
     <section className="import">
       <div className="import-grid">
@@ -39,13 +39,13 @@ export function ImportPanel(props: ImportPanelProps) {
         />
       </div>
       <div className="import-actions">
-        <button className="btn primary lg" disabled={!canAlign} onClick={props.onAlign}>
-          {props.aligning ? '对齐中…' : '开始顺序对齐'}
+        <button className="btn primary lg" disabled={!canNext} onClick={props.onNext}>
+          下一步：时间轴校准
         </button>
         <button className="btn ghost lg" onClick={props.onSample}>
           加载示例数据
         </button>
-        {!canAlign && !props.aligning && (
+        {!canNext && (
           <span className="hint">请先为两个版本各导入一份 SRT（文件选择 / 拖拽 / 粘贴）</span>
         )}
       </div>
